@@ -443,12 +443,19 @@ class SafetensorsMetadataCleaner:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "file": (_list_safetensors_files(),),
+                "file": (["(選択なし)"] + _list_safetensors_files(),),
                 "save_name": ("STRING", {"default": "cleaned_model.safetensors"}),
                 "remove_all_metadata": ("BOOLEAN", {"default": True}),
+                "overwrite": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Trueの場合、save_nameは無視され、元ファイルを直接上書きクリーンアップします。既存の保存ノードから出力されたパスを処理する際に便利です。"
+                }),
             },
             "optional": {
-                "custom_path": ("STRING", {"default": ""}),
+                "custom_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "既存の保存ノードの出力パス（STRING型）をここに繋ぐと、自動でそのファイルを処理します。"
+                }),
                 "remove_keys_by_regex": ("STRING", {
                     "default": ".*path.*|.*hash.*",
                     "tooltip": "remove_all_metadataがFalseの場合に、このパターンにマッチするキーを削除します。パイプ(|)で複数指定可。"
@@ -466,37 +473,37 @@ class SafetensorsMetadataCleaner:
     RETURN_NAMES = ("saved_path",)
     FUNCTION = "clean"
     CATEGORY = "image"
-    DESCRIPTION = "Safetensorsのメタデータから不要な情報（マージ履歴、ローカルパスなど）を除去して、新しいファイルとして保存します。メモリを消費しません。"
+    DESCRIPTION = "Safetensorsのメタデータから不要な情報（マージ履歴、ローカルパスなど）を除去して、保存します。メモリを消費しません。"
 
-    def clean(self, file, save_name, remove_all_metadata, custom_path="", remove_keys_by_regex="", custom_metadata_json=""):
+    def clean(self, file, save_name, remove_all_metadata, overwrite, custom_path="", remove_keys_by_regex="", custom_metadata_json=""):
         custom_path = custom_path.strip().strip('"').strip("'")
         if custom_path:
             src_path = custom_path
         else:
-            if _SEP not in file:
-                raise ValueError("モデルフォルダにsafetensorsがありません。custom_pathにフルパスを入れてください")
+            if file == "(選択なし)" or _SEP not in file:
+                raise ValueError("ファイルが選択されていないか、custom_pathが指定されていません。")
             folder, name = file.split(_SEP, 1)
             src_path = folder_paths.get_full_path(folder, name)
 
         if not src_path or not os.path.isfile(src_path):
             raise ValueError(f"元ファイルが見つかりません: {src_path}")
 
-        if not custom_path:
-            folder, name = file.split(_SEP, 1)
-            dest_dir = os.path.dirname(src_path)
+        if overwrite:
+            dst_path = src_path
         else:
             dest_dir = os.path.dirname(src_path)
+            save_name = save_name.strip()
+            if not save_name.lower().endswith((".safetensors", ".sft")):
+                save_name += ".safetensors"
+            dst_path = os.path.join(dest_dir, save_name)
 
-        save_name = save_name.strip()
-        if not save_name.lower().endswith((".safetensors", ".sft")):
-            save_name += ".safetensors"
-        dst_path = os.path.join(dest_dir, save_name)
-
-        if os.path.abspath(src_path) == os.path.abspath(dst_path):
-            raise ValueError("元ファイルと保存先ファイルが同じです。別名で保存してください。")
+            if os.path.abspath(src_path) == os.path.abspath(dst_path):
+                raise ValueError("元ファイルと保存先ファイルが同じです。上書きする場合は overwrite を True にしてください。")
 
         with open(src_path, 'rb') as f_src:
             header_size_bytes = f_src.read(8)
+            if len(header_size_bytes) < 8:
+                raise ValueError("有効な safetensors ファイルではありません。")
             header_size = struct.unpack('<Q', header_size_bytes)[0]
             header_bytes = f_src.read(header_size)
             header = json.loads(header_bytes.decode('utf-8'))
@@ -541,18 +548,31 @@ class SafetensorsMetadataCleaner:
         new_header_size = len(new_header_bytes)
         new_header_size_bytes = struct.pack('<Q', new_header_size)
 
-        with open(dst_path, 'wb') as f_dst:
-            f_dst.write(new_header_size_bytes)
-            f_dst.write(new_header_bytes)
+        write_path = dst_path + ".tmp" if overwrite else dst_path
 
-            with open(src_path, 'rb') as f_src:
-                f_src.seek(8 + header_size)
-                chunk_size = 64 * 1024 * 1024
-                while True:
-                    chunk = f_src.read(chunk_size)
-                    if not chunk:
-                        break
-                    f_dst.write(chunk)
+        try:
+            with open(write_path, 'wb') as f_dst:
+                f_dst.write(new_header_size_bytes)
+                f_dst.write(new_header_bytes)
+
+                with open(src_path, 'rb') as f_src:
+                    f_src.seek(8 + header_size)
+                    chunk_size = 64 * 1024 * 1024
+                    while True:
+                        chunk = f_src.read(chunk_size)
+                        if not chunk:
+                            break
+                        f_dst.write(chunk)
+
+            if overwrite:
+                if os.path.exists(dst_path):
+                    os.remove(dst_path)
+                os.rename(write_path, dst_path)
+
+        except Exception as e:
+            if overwrite and os.path.exists(write_path):
+                os.remove(write_path)
+            raise e
 
         print(f"[SafetensorsMetadataCleaner] クリーンアップされたファイルを保存しました: {dst_path}")
         return (dst_path,)
