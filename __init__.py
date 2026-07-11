@@ -294,10 +294,278 @@ class PNGInfoReadable:
         return True
 
 
+import struct
+
+_FOLDERS = ["checkpoints", "loras", "vae", "diffusion_models", "unet",
+            "text_encoders", "clip", "embeddings", "controlnet",
+            "upscale_models"]
+
+_SEP = " :: "
+
+def _list_safetensors_files():
+    seen = set()
+    choices = []
+    for folder in _FOLDERS:
+        try:
+            names = folder_paths.get_filename_list(folder)
+        except Exception:
+            continue
+        for name in names:
+            if not name.lower().endswith((".safetensors", ".sft")):
+                continue
+            full = folder_paths.get_full_path(folder, name)
+            if full in seen:
+                continue
+            seen.add(full)
+            choices.append(folder + _SEP + name)
+    return choices or ["(safetensorsが見つかりません)"]
+
+
+class SafetensorsInfoReadable:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "file": (_list_safetensors_files(),),
+            },
+            "optional": {
+                "custom_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "ここにフルパスを入れると、上の選択より優先してそのファイルを読む"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("info", "json")
+    FUNCTION = "read"
+    CATEGORY = "image"
+    DESCRIPTION = "Safetensorsのメタデータ（マージ情報や学習設定など）をロードせずに瞬時に読み取って表示します。"
+
+    def read(self, file, custom_path=""):
+        custom_path = custom_path.strip().strip('"').strip("'")
+        if custom_path:
+            path = custom_path
+        else:
+            if _SEP not in file:
+                raise ValueError("モデルフォルダにsafetensorsがありません。custom_pathにフルパスを入れてください")
+            folder, name = file.split(_SEP, 1)
+            path = folder_paths.get_full_path(folder, name)
+            
+        if not path or not os.path.isfile(path):
+            raise ValueError(f"ファイルが見つかりません: {path}")
+
+        meta, tensor_count = self.read_header(path)
+        report = self.build_report(path, meta, tensor_count)
+        js = self.metadata_json(meta)
+        return (report, js)
+
+    def read_header(self, path):
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(8)
+            if len(head) < 8:
+                raise ValueError("ファイルが小さすぎます")
+            n = struct.unpack("<Q", head)[0]
+            if n <= 0 or n > size or n > 100 * 1024 * 1024:
+                raise ValueError("ヘッダサイズが不正です")
+            try:
+                header = json.loads(f.read(n).decode("utf-8"))
+            except Exception:
+                raise ValueError("ヘッダがJSONとして読めません")
+        meta = header.get("__metadata__", {}) or {}
+        tensor_count = len([k for k in header if k != "__metadata__"])
+        return meta, tensor_count
+
+    def build_report(self, path, meta, tensor_count):
+        lines = [
+            f"file: {os.path.basename(path)}",
+            f"path: {path}",
+            f"size: {self.format_bytes(os.path.getsize(path))}",
+            f"tensors: {tensor_count}",
+            f"metadata: {len(meta)} items",
+        ]
+        if not meta:
+            lines.append("\n__metadata__ は空です")
+        for k in sorted(meta.keys()):
+            v = meta[k]
+            parsed = self.try_parse_json(v)
+            lines.append(f"\n--- {k} ---")
+            if parsed is not None:
+                lines.append(json.dumps(parsed, ensure_ascii=False, indent=2))
+            else:
+                lines.append(str(v))
+        return "\n".join(lines)
+
+    def metadata_json(self, meta):
+        out = {}
+        for k, v in meta.items():
+            parsed = self.try_parse_json(v)
+            out[k] = parsed if parsed is not None else v
+        return json.dumps(out, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def try_parse_json(s):
+        if not isinstance(s, str):
+            return None
+        t = s.strip()
+        if not (t.startswith("{") or t.startswith("[")):
+            return None
+        try:
+            return json.loads(t)
+        except Exception:
+            return None
+
+    @staticmethod
+    def format_bytes(n):
+        n = float(n)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n < 1024.0 or unit == "TB":
+                return f"{n:.2f} {unit}" if unit != "B" else f"{int(n)} B"
+            n /= 1024.0
+
+    @classmethod
+    def IS_CHANGED(cls, file, custom_path=""):
+        try:
+            custom_path = custom_path.strip().strip('"').strip("'")
+            if custom_path:
+                path = custom_path
+            else:
+                folder, name = file.split(_SEP, 1)
+                path = folder_paths.get_full_path(folder, name)
+            return f"{path}:{os.path.getmtime(path)}"
+        except Exception:
+            return float("nan")
+
+
+class SafetensorsMetadataCleaner:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "file": (_list_safetensors_files(),),
+                "save_name": ("STRING", {"default": "cleaned_model.safetensors"}),
+                "remove_all_metadata": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "custom_path": ("STRING", {"default": ""}),
+                "remove_keys_by_regex": ("STRING", {
+                    "default": ".*path.*|.*hash.*",
+                    "tooltip": "remove_all_metadataがFalseの場合に、このパターンにマッチするキーを削除します。パイプ(|)で複数指定可。"
+                }),
+                "custom_metadata_json": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": '{\n  "author": "Anonymous"\n}',
+                    "tooltip": "追加または上書きしたいメタデータをJSON形式で入力します。"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("saved_path",)
+    FUNCTION = "clean"
+    CATEGORY = "image"
+    DESCRIPTION = "Safetensorsのメタデータから不要な情報（マージ履歴、ローカルパスなど）を除去して、新しいファイルとして保存します。メモリを消費しません。"
+
+    def clean(self, file, save_name, remove_all_metadata, custom_path="", remove_keys_by_regex="", custom_metadata_json=""):
+        custom_path = custom_path.strip().strip('"').strip("'")
+        if custom_path:
+            src_path = custom_path
+        else:
+            if _SEP not in file:
+                raise ValueError("モデルフォルダにsafetensorsがありません。custom_pathにフルパスを入れてください")
+            folder, name = file.split(_SEP, 1)
+            src_path = folder_paths.get_full_path(folder, name)
+
+        if not src_path or not os.path.isfile(src_path):
+            raise ValueError(f"元ファイルが見つかりません: {src_path}")
+
+        if not custom_path:
+            folder, name = file.split(_SEP, 1)
+            dest_dir = os.path.dirname(src_path)
+        else:
+            dest_dir = os.path.dirname(src_path)
+
+        save_name = save_name.strip()
+        if not save_name.lower().endswith((".safetensors", ".sft")):
+            save_name += ".safetensors"
+        dst_path = os.path.join(dest_dir, save_name)
+
+        if os.path.abspath(src_path) == os.path.abspath(dst_path):
+            raise ValueError("元ファイルと保存先ファイルが同じです。別名で保存してください。")
+
+        with open(src_path, 'rb') as f_src:
+            header_size_bytes = f_src.read(8)
+            header_size = struct.unpack('<Q', header_size_bytes)[0]
+            header_bytes = f_src.read(header_size)
+            header = json.loads(header_bytes.decode('utf-8'))
+
+        meta = header.get('__metadata__', {}) or {}
+        
+        if remove_all_metadata:
+            new_meta = {}
+        else:
+            new_meta = meta.copy()
+            if remove_keys_by_regex.strip():
+                try:
+                    pattern = re.compile(remove_keys_by_regex.strip(), re.IGNORECASE)
+                    new_meta = {k: v for k, v in new_meta.items() if not pattern.search(k)}
+                except Exception as e:
+                    raise ValueError(f"正規表現パターンが無効です: {str(e)}")
+
+        custom_metadata_json = custom_metadata_json.strip()
+        if custom_metadata_json:
+            try:
+                custom_meta = json.loads(custom_metadata_json)
+                if not isinstance(custom_meta, dict):
+                    raise ValueError("カスタムメタデータはJSONオブジェクト形式である必要があります")
+                new_meta.update(custom_meta)
+            except Exception as e:
+                raise ValueError(f"カスタムメタデータJSONの解析に失敗しました: {str(e)}")
+
+        if not new_meta:
+            if '__metadata__' in header:
+                del header['__metadata__']
+        else:
+            header['__metadata__'] = new_meta
+
+        new_header_str = json.dumps(header, separators=(',', ':'))
+        new_header_bytes = new_header_str.encode('utf-8')
+
+        current_len = 8 + len(new_header_bytes)
+        padding_len = (8 - (current_len % 8)) % 8
+        if padding_len > 0:
+            new_header_bytes += b' ' * padding_len
+
+        new_header_size = len(new_header_bytes)
+        new_header_size_bytes = struct.pack('<Q', new_header_size)
+
+        with open(dst_path, 'wb') as f_dst:
+            f_dst.write(new_header_size_bytes)
+            f_dst.write(new_header_bytes)
+
+            with open(src_path, 'rb') as f_src:
+                f_src.seek(8 + header_size)
+                chunk_size = 64 * 1024 * 1024
+                while True:
+                    chunk = f_src.read(chunk_size)
+                    if not chunk:
+                        break
+                    f_dst.write(chunk)
+
+        print(f"[SafetensorsMetadataCleaner] クリーンアップされたファイルを保存しました: {dst_path}")
+        return (dst_path,)
+
+
 NODE_CLASS_MAPPINGS = {
     "PNGInfoReadable": PNGInfoReadable,
+    "SafetensorsInfoReadable": SafetensorsInfoReadable,
+    "SafetensorsMetadataCleaner": SafetensorsMetadataCleaner,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PNGInfoReadable": "PNG Info (Readable)",
+    "SafetensorsInfoReadable": "Safetensors Info (Readable)",
+    "SafetensorsMetadataCleaner": "Safetensors Metadata Cleaner",
 }
