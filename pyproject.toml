@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-pnginfo"
+description = "A1111-style PNG Info for ComfyUI: load an image, read its generation metadata as human-readable text (A1111 parameters and ComfyUI embedded workflows), and reuse positive/negative/seed/steps/cfg as typed outputs."
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/galigali-san/ComfyUI-PNGInfo"
+
+[tool.comfy]
+PublisherId = "galigali"
+DisplayName = "ComfyUI-PNGInfo"
+Icon = ""
