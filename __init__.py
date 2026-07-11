@@ -439,6 +439,8 @@ class SafetensorsInfoReadable:
 
 
 class SafetensorsMetadataCleaner:
+    OUTPUT_NODE = True
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
