@@ -3,6 +3,9 @@
 A1111の「PNG Info」の気軽さをComfyUIに持ってくるノード。
 画像のメタデータを**人間が読める形**で表示し、主要な値を**型付き出力**で再利用できる。
 
+![PNG Info (Readable)](docs/pnginfo.png)
+
+
 > **English**: A1111-style "PNG Info" for ComfyUI. Loads an image, shows its
 > generation metadata as human-readable text (works with both A1111
 > `parameters` text and ComfyUI embedded workflows), and exposes
